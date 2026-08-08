@@ -1,5 +1,7 @@
 import os
+import math
 import requests
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from pymongo import MongoClient
 
@@ -11,19 +13,48 @@ MAIN_BOT_TOKEN = os.environ["MAIN_BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 BASE_URL = os.environ["BASE_URL"].rstrip("/")  # e.g. https://your-app.vercel.app
 
+PAGE_SIZE = 5          # clones shown per page in /clones
+REFRESH_BATCH = 25     # users checked per /refresh call (stays well under Vercel's 10s cap)
+
 # ── DB (reused across warm invocations) ─────────────────────────────────────
 _client = MongoClient(MONGO_URL)
 db = _client["deeplink_bot"]
 bots_col = db["bots"]
+meta_col = db["meta"]
+
+bots_col.create_index("bot_id")
+bots_col.create_index("parent_token")
+bots_col.create_index("owner_id")
 
 
+def get_users_collection(bot_id: str):
+    """Each bot — main and every clone — gets its own isolated users collection,
+    so blocking/removing a user on one bot never touches another bot's data."""
+    return db[f"users_{bot_id}"]
+
+
+# ── Small-caps unicode styling ───────────────────────────────────────────────
+_SMALL_CAPS = {
+    "a": "ᴀ", "b": "ʙ", "c": "ᴄ", "d": "ᴅ", "e": "ᴇ", "f": "ꜰ", "g": "ɢ",
+    "h": "ʜ", "i": "ɪ", "j": "ᴊ", "k": "ᴋ", "l": "ʟ", "m": "ᴍ", "n": "ɴ",
+    "o": "ᴏ", "p": "ᴘ", "q": "ǫ", "r": "ʀ", "s": "s", "t": "ᴛ", "u": "ᴜ",
+    "v": "ᴠ", "w": "ᴡ", "x": "x", "y": "ʏ", "z": "ᴢ",
+}
+
+
+def sc(text: str) -> str:
+    """Render text in small-caps unicode for headers/labels."""
+    return "".join(_SMALL_CAPS.get(ch.lower(), ch) for ch in text)
+
+
+# ── Telegram helpers ─────────────────────────────────────────────────────────
 def tg_call(token: str, method: str, payload: dict):
     url = f"https://api.telegram.org/bot{token}/{method}"
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=8)
         return r.json()
     except requests.RequestException as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "description": str(e)}
 
 
 def send_message(token, chat_id, text, reply_markup=None):
@@ -33,27 +64,224 @@ def send_message(token, chat_id, text, reply_markup=None):
     return tg_call(token, "sendMessage", payload)
 
 
+def edit_message(token, chat_id, message_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg_call(token, "editMessageText", payload)
+
+
+def answer_callback(token, callback_id, text=None, alert=False):
+    payload = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+        payload["show_alert"] = alert
+    return tg_call(token, "answerCallbackQuery", payload)
+
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
 def get_bot_doc(token):
     return bots_col.find_one({"_id": token})
 
 
+def get_bot_by_id(bot_id):
+    return bots_col.find_one({"bot_id": bot_id})
+
+
+def bot_id_of(token, bot_doc):
+    """Prefer the stored bot_id; fall back to deriving it from the token
+    (covers bots registered before this field existed)."""
+    return (bot_doc or {}).get("bot_id") or token.split(":")[0]
+
+
 def ensure_main_bot():
-    """Make sure the main bot has a DB row. Runs cheaply (indexed _id lookup)."""
     if not get_bot_doc(MAIN_BOT_TOKEN):
+        me = tg_call(MAIN_BOT_TOKEN, "getMe", {})
+        username = me.get("result", {}).get("username") if me.get("ok") else None
         bots_col.update_one(
             {"_id": MAIN_BOT_TOKEN},
-            {
-                "$setOnInsert": {
-                    "owner_id": OWNER_ID,
-                    "is_main": True,
-                    "target_username": None,
-                    "parent_token": None,
-                }
-            },
+            {"$setOnInsert": {
+                "owner_id": OWNER_ID,
+                "is_main": True,
+                "target_username": None,
+                "parent_token": None,
+                "bot_id": MAIN_BOT_TOKEN.split(":")[0],
+                "username": username,
+                "banned": False,
+            }},
             upsert=True,
         )
 
 
+def track_user(bot_id, user_id):
+    now = datetime.now(timezone.utc)
+    col = get_users_collection(bot_id)
+    col.update_one(
+        {"_id": user_id},
+        {
+            "$set": {"last_seen": now, "blocked": False},
+            "$setOnInsert": {"first_seen": now},
+        },
+        upsert=True,
+    )
+
+
+# ── View builders ────────────────────────────────────────────────────────────
+def build_clones_keyboard(page=0):
+    clones = list(bots_col.find({"parent_token": MAIN_BOT_TOKEN}).sort("_id", 1))
+    total = len(clones)
+
+    if total == 0:
+        return f"{sc('clones overview')}\n\n{sc('no clones yet')}", None, 0
+
+    start = page * PAGE_SIZE
+    page_items = clones[start:start + PAGE_SIZE]
+
+    rows = []
+    for c in page_items:
+        uname = c.get("username") or c.get("bot_id", "?")
+        status_icon = "🚫" if c.get("banned") else "✅"
+        rows.append([{"text": f"{status_icon} @{uname}", "callback_data": "noop"}])
+
+        ban_action = "unban" if c.get("banned") else "ban"
+        ban_label = ("✅ " + sc("unban")) if c.get("banned") else ("🚫 " + sc("ban"))
+        rows.append([
+            {"text": ban_label, "callback_data": f"cl:{ban_action}:{c['bot_id']}:{page}"},
+            {"text": "🗑 " + sc("remove"), "callback_data": f"cl:rm:{c['bot_id']}:{page}"},
+        ])
+
+    total_pages = max(1, math.ceil(total / PAGE_SIZE))
+    nav = []
+    if page > 0:
+        nav.append({"text": "⬅️", "callback_data": f"cl:page:{page - 1}"})
+    nav.append({"text": f"{page + 1}/{total_pages}", "callback_data": "noop"})
+    if start + PAGE_SIZE < total:
+        nav.append({"text": "➡️", "callback_data": f"cl:page:{page + 1}"})
+    rows.append(nav)
+
+    text = f"{sc('clones overview')}\n\n{sc('total')}: {total}"
+    return text, {"inline_keyboard": rows}, total
+
+
+def build_mybots_view(user_id):
+    clones = list(
+        bots_col.find({"parent_token": MAIN_BOT_TOKEN, "owner_id": user_id}).sort("_id", 1)
+    )
+    if not clones:
+        return f"{sc('your clones')}\n\n{sc('you have none yet')}", None
+
+    rows = [
+        [{"text": f"🗑 @{c.get('username') or c.get('bot_id', '?')}", "callback_data": f"mb:rm:{c['bot_id']}"}]
+        for c in clones
+    ]
+    text = f"{sc('your clones')}\n\n{sc('total')}: {len(clones)}"
+    return text, {"inline_keyboard": rows}
+
+
+# ── Callback (button tap) handling ──────────────────────────────────────────
+def handle_callback(token, bot_doc, callback):
+    data = callback.get("data", "")
+    from_id = callback["from"]["id"]
+    chat_id = callback["message"]["chat"]["id"]
+    message_id = callback["message"]["message_id"]
+    cb_id = callback["id"]
+    is_main_owner = from_id == OWNER_ID
+    is_main = bot_doc.get("is_main", False)
+
+    if data == "noop":
+        answer_callback(token, cb_id)
+        return
+
+    # ── /clones admin actions (main bot, main owner only) ──────────────────
+    if data.startswith("cl:"):
+        if not (is_main and is_main_owner):
+            answer_callback(token, cb_id, sc("owner only"), alert=True)
+            return
+
+        parts = data.split(":")
+        action = parts[1]
+
+        if action == "page":
+            page = int(parts[2])
+            view_text, markup, _ = build_clones_keyboard(page)
+            edit_message(token, chat_id, message_id, view_text, markup)
+            answer_callback(token, cb_id)
+            return
+
+        bot_id, page = parts[2], int(parts[3])
+        clone = get_bot_by_id(bot_id)
+        if not clone:
+            answer_callback(token, cb_id, sc("not found"), alert=True)
+            view_text, markup, _ = build_clones_keyboard(page)
+            edit_message(token, chat_id, message_id, view_text, markup)
+            return
+
+        if action == "ban":
+            tg_call(clone["_id"], "deleteWebhook", {})
+            bots_col.update_one({"_id": clone["_id"]}, {"$set": {"banned": True}})
+            answer_callback(token, cb_id, sc("banned"))
+
+        elif action == "unban":
+            tg_call(clone["_id"], "setWebhook", {"url": f"{BASE_URL}/webhook/{clone['_id']}"})
+            bots_col.update_one({"_id": clone["_id"]}, {"$set": {"banned": False}})
+            answer_callback(token, cb_id, sc("unbanned"))
+
+        elif action == "rm":
+            uname = clone.get("username") or bot_id
+            confirm_kb = {"inline_keyboard": [[
+                {"text": "✅ " + sc("confirm"), "callback_data": f"cl:rmyes:{bot_id}:{page}"},
+                {"text": "✖️ " + sc("cancel"), "callback_data": f"cl:page:{page}"},
+            ]]}
+            edit_message(token, chat_id, message_id, f"{sc('remove')} @{uname}?", confirm_kb)
+            answer_callback(token, cb_id)
+            return
+
+        elif action == "rmyes":
+            tg_call(clone["_id"], "deleteWebhook", {})
+            bots_col.delete_one({"_id": clone["_id"]})
+            answer_callback(token, cb_id, sc("removed"))
+
+        view_text, markup, _ = build_clones_keyboard(page)
+        edit_message(token, chat_id, message_id, view_text, markup)
+        return
+
+    # ── /mybots actions (any user, own clones only) ────────────────────────
+    if data.startswith("mb:"):
+        parts = data.split(":")
+        action = parts[1]
+
+        if action == "cancel":
+            view_text, markup = build_mybots_view(from_id)
+            edit_message(token, chat_id, message_id, view_text, markup)
+            answer_callback(token, cb_id)
+            return
+
+        bot_id = parts[2]
+        clone = get_bot_by_id(bot_id)
+        if not clone or clone.get("owner_id") != from_id:
+            answer_callback(token, cb_id, sc("not yours"), alert=True)
+            return
+
+        if action == "rm":
+            uname = clone.get("username") or bot_id
+            confirm_kb = {"inline_keyboard": [[
+                {"text": "✅ " + sc("confirm"), "callback_data": f"mb:rmyes:{bot_id}"},
+                {"text": "✖️ " + sc("cancel"), "callback_data": "mb:cancel"},
+            ]]}
+            edit_message(token, chat_id, message_id, f"{sc('remove your clone')} @{uname}?", confirm_kb)
+            answer_callback(token, cb_id)
+            return
+
+        elif action == "rmyes":
+            tg_call(clone["_id"], "deleteWebhook", {})
+            bots_col.delete_one({"_id": clone["_id"]})
+            answer_callback(token, cb_id, sc("removed"))
+            view_text, markup = build_mybots_view(from_id)
+            edit_message(token, chat_id, message_id, view_text, markup)
+            return
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
     return "Bot is alive."
@@ -63,6 +291,18 @@ def health():
 def webhook(token):
     ensure_main_bot()
     update = request.get_json(force=True, silent=True) or {}
+
+    bot_doc = get_bot_doc(token)
+    if not bot_doc or bot_doc.get("banned"):
+        return jsonify(ok=True)
+
+    # ── Button taps ──────────────────────────────────────────────────────────
+    callback = update.get("callback_query")
+    if callback:
+        handle_callback(token, bot_doc, callback)
+        return jsonify(ok=True)
+
+    # ── Regular messages ─────────────────────────────────────────────────────
     message = update.get("message")
     if not message or "text" not in message:
         return jsonify(ok=True)
@@ -70,11 +310,9 @@ def webhook(token):
     chat_id = message["chat"]["id"]
     from_id = message["from"]["id"]
     text = message["text"].strip()
+    bot_id = bot_id_of(token, bot_doc)
 
-    bot_doc = get_bot_doc(token)
-    if not bot_doc:
-        # Unknown token hitting our webhook — ignore silently.
-        return jsonify(ok=True)
+    track_user(bot_id, from_id)
 
     is_owner = from_id == bot_doc.get("owner_id")
     is_main_owner = from_id == OWNER_ID
@@ -87,22 +325,18 @@ def webhook(token):
         target = bot_doc.get("target_username")
 
         if not target:
-            send_message(
-                token, chat_id,
-                "This bot isn't configured yet. Ask the owner to set a target "
-                "with /username <bot_username>."
-            )
+            send_message(token, chat_id, "⚠️ " + sc("this bot isn't configured yet"))
             return jsonify(ok=True)
 
         link = f"https://t.me/{target}" + (f"?start={payload}" if payload else "")
-        reply_markup = {"inline_keyboard": [[{"text": "Here's your link", "url": link}]]}
-        send_message(token, chat_id, "Tap below to continue:", reply_markup)
+        reply_markup = {"inline_keyboard": [[{"text": "🔗 " + sc("here's your link"), "url": link}]]}
+        send_message(token, chat_id, sc("tap below to continue") + " 👇", reply_markup)
         return jsonify(ok=True)
 
     # ── /username <name> — set this bot's deep-link redirect target ────────
     if text.startswith("/username"):
         if not (is_owner or is_main_owner):
-            send_message(token, chat_id, "Only the bot owner can set this.")
+            send_message(token, chat_id, "⚠️ " + sc("only the bot owner can set this"))
             return jsonify(ok=True)
 
         parts = text.split(maxsplit=1)
@@ -112,10 +346,10 @@ def webhook(token):
 
         uname = parts[1].strip().lstrip("@")
         bots_col.update_one({"_id": token}, {"$set": {"target_username": uname}})
-        send_message(token, chat_id, f"Deep-link target set to @{uname}")
+        send_message(token, chat_id, f"✅ {sc('target set to')} @{uname}")
         return jsonify(ok=True)
 
-    # ── /clone <bot_token> — only on the main bot ───────────────────────────
+    # ── /clone <bot_token> — register a new clone (main bot only) ──────────
     if text.startswith("/clone") and is_main:
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
@@ -125,14 +359,15 @@ def webhook(token):
         new_token = parts[1].strip()
         me = tg_call(new_token, "getMe", {})
         if not me.get("ok"):
-            send_message(token, chat_id, "That doesn't look like a valid bot token.")
+            send_message(token, chat_id, "❌ " + sc("that doesn't look like a valid bot token"))
             return jsonify(ok=True)
 
         set_wh = tg_call(new_token, "setWebhook", {"url": f"{BASE_URL}/webhook/{new_token}"})
         if not set_wh.get("ok"):
-            send_message(token, chat_id, f"Could not set webhook: {set_wh.get('description', 'unknown error')}")
+            send_message(token, chat_id, "❌ " + sc("could not set webhook") + f": {set_wh.get('description', '?')}")
             return jsonify(ok=True)
 
+        bot_result = me["result"]
         bots_col.update_one(
             {"_id": new_token},
             {"$set": {
@@ -140,16 +375,83 @@ def webhook(token):
                 "is_main": False,
                 "target_username": None,
                 "parent_token": MAIN_BOT_TOKEN,
+                "bot_id": str(bot_result["id"]),
+                "username": bot_result.get("username"),
+                "banned": False,
             }},
             upsert=True,
         )
 
-        uname = me["result"]["username"]
         send_message(
             token, chat_id,
-            f"Cloned successfully: @{uname}\n"
-            f"Now message @{uname} directly with /username <target_bot_username> to configure it."
+            f"✅ {sc('clone created')}: @{bot_result.get('username')}\n\n"
+            f"{sc('message it directly with')} /username <target> {sc('to configure it')}"
         )
+        return jsonify(ok=True)
+
+    # ── /clones — total + toggle-button management (main owner only) ───────
+    if text.startswith("/clones") and is_main and is_main_owner:
+        view_text, markup, _ = build_clones_keyboard(0)
+        send_message(token, chat_id, view_text, markup)
+        return jsonify(ok=True)
+
+    # ── /mybots — any user removes their own clone(s) (main bot) ───────────
+    if text.startswith("/mybots") and is_main:
+        view_text, markup = build_mybots_view(from_id)
+        send_message(token, chat_id, view_text, markup)
+        return jsonify(ok=True)
+
+    # ── /users — this bot's own user stats (owner or main owner) ───────────
+    if text.startswith("/users") and (is_owner or is_main_owner):
+        col = get_users_collection(bot_id)
+        total = col.count_documents({})
+        blocked = col.count_documents({"blocked": True})
+        active = total - blocked
+        msg = (
+            f"{sc('users overview')}\n\n"
+            f"{sc('total')}: {total}\n"
+            f"{sc('active')}: {active}\n"
+            f"{sc('blocked')}: {blocked}"
+        )
+        send_message(token, chat_id, msg)
+        return jsonify(ok=True)
+
+    # ── /refresh — sweep + remove dead/blocked users for THIS bot ──────────
+    if text.startswith("/refresh") and (is_owner or is_main_owner):
+        col = get_users_collection(bot_id)
+        cursor_key = f"refresh_cursor_{bot_id}"
+        cursor_doc = meta_col.find_one({"_id": cursor_key}) or {}
+        last_id = cursor_doc.get("last_id", 0)
+
+        query = {"_id": {"$gt": last_id}} if last_id else {}
+        batch = list(col.find(query).sort("_id", 1).limit(REFRESH_BATCH))
+
+        if not batch:
+            meta_col.update_one({"_id": cursor_key}, {"$set": {"last_id": 0}}, upsert=True)
+            send_message(token, chat_id, "✅ " + sc("sweep complete — starting over next time"))
+            return jsonify(ok=True)
+
+        checked = 0
+        removed = 0
+        last_checked_id = last_id
+        for u in batch:
+            checked += 1
+            last_checked_id = u["_id"]
+            result = tg_call(token, "sendChatAction", {"chat_id": u["_id"], "action": "typing"})
+            if not result.get("ok"):
+                desc = str(result.get("description", "")).lower()
+                if "blocked" in desc or "deactivated" in desc or "not found" in desc:
+                    col.delete_one({"_id": u["_id"]})
+                    removed += 1
+
+        meta_col.update_one({"_id": cursor_key}, {"$set": {"last_id": last_checked_id}}, upsert=True)
+        msg = (
+            f"{sc('refresh batch complete')}\n\n"
+            f"{sc('checked')}: {checked}\n"
+            f"{sc('removed')}: {removed}\n\n"
+            f"{sc('run again to continue the sweep')}"
+        )
+        send_message(token, chat_id, msg)
         return jsonify(ok=True)
 
     # ── /setusername <clone_token> <name> — main owner overrides a clone ───
@@ -164,24 +466,10 @@ def webhook(token):
             {"_id": clone_token, "parent_token": MAIN_BOT_TOKEN},
             {"$set": {"target_username": uname}},
         )
-        send_message(token, chat_id, "Updated." if result.matched_count else "Clone not found.")
+        send_message(token, chat_id, "✅ " + sc("updated") if result.matched_count else "❌ " + sc("clone not found"))
         return jsonify(ok=True)
 
-    # ── /clones — list all clones (main owner only) ─────────────────────────
-    if text.startswith("/clones") and is_main and is_main_owner:
-        clones = list(bots_col.find({"parent_token": MAIN_BOT_TOKEN}))
-        if not clones:
-            send_message(token, chat_id, "No clones yet.")
-        else:
-            lines = [
-                f"• {c['_id'][:10]}… → target: @{c.get('target_username') or 'not set'} "
-                f"(owner: {c.get('owner_id')})"
-                for c in clones
-            ]
-            send_message(token, chat_id, "\n".join(lines))
-        return jsonify(ok=True)
-
-    # ── /delclone <clone_token> — remove a clone + its webhook (main owner) ─
+    # ── /delclone <clone_token> — fallback text command (main owner) ───────
     if text.startswith("/delclone") and is_main and is_main_owner:
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
@@ -190,7 +478,7 @@ def webhook(token):
         clone_token = parts[1].strip()
         tg_call(clone_token, "deleteWebhook", {})
         result = bots_col.delete_one({"_id": clone_token, "parent_token": MAIN_BOT_TOKEN})
-        send_message(token, chat_id, "Removed." if result.deleted_count else "Clone not found.")
+        send_message(token, chat_id, "✅ " + sc("removed") if result.deleted_count else "❌ " + sc("clone not found"))
         return jsonify(ok=True)
 
     return jsonify(ok=True)
