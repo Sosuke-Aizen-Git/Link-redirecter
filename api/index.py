@@ -107,22 +107,69 @@ def ensure_main_bot():
                 "parent_token": None,
                 "bot_id": MAIN_BOT_TOKEN.split(":")[0],
                 "username": username,
+                "name": me.get("result", {}).get("first_name") if me.get("ok") else None,
                 "banned": False,
             }},
             upsert=True,
         )
 
 
-def track_user(bot_id, user_id):
+def track_user(bot_id, user_id, first_name=None, username=None):
     now = datetime.now(timezone.utc)
     col = get_users_collection(bot_id)
+    set_fields = {"last_seen": now, "blocked": False}
+    if first_name is not None:
+        set_fields["first_name"] = first_name
+    if username is not None:
+        set_fields["username"] = username
     col.update_one(
         {"_id": user_id},
         {
-            "$set": {"last_seen": now, "blocked": False},
+            "$set": set_fields,
             "$setOnInsert": {"first_seen": now},
         },
         upsert=True,
+    )
+
+
+def ensure_bot_name(clone):
+    """Prefer the stored display name; backfill it via getMe for clones
+    registered before this field existed."""
+    if clone.get("name"):
+        return clone["name"]
+    me = tg_call(clone["_id"], "getMe", {})
+    name = me.get("result", {}).get("first_name") if me.get("ok") else None
+    if name:
+        bots_col.update_one({"_id": clone["_id"]}, {"$set": {"name": name}})
+        return name
+    return clone.get("username") or bot_id_of(clone["_id"], clone)
+
+
+def get_owner_label(owner_id):
+    """Look up the owner's name/username from the main bot's own users
+    collection (they must have messaged the main bot to own a clone)."""
+    main_doc = get_bot_doc(MAIN_BOT_TOKEN)
+    main_id = bot_id_of(MAIN_BOT_TOKEN, main_doc)
+    user = get_users_collection(main_id).find_one({"_id": owner_id})
+    name = (user or {}).get("first_name")
+    uname = (user or {}).get("username")
+    label = name or "?"
+    if uname:
+        label += f" (@{uname})"
+    return f"{label} — {owner_id}"
+
+
+def build_bot_detail_text(clone, bid):
+    name = ensure_bot_name(clone)
+    uname = clone.get("username")
+    uname_disp = f"@{uname}" if uname else "?"
+    token = clone.get("_id", "?")
+    owner_label = get_owner_label(clone.get("owner_id"))
+    return (
+        f"{sc('bot name')}: {name}\n"
+        f"{sc('username')}: {uname_disp}\n"
+        f"{sc('api token')}: {token}\n"
+        f"{sc('owner')}: {owner_label}"
     )
 
 
@@ -144,14 +191,7 @@ def build_clones_keyboard(page=0):
             bots_col.update_one({"_id": c["_id"]}, {"$set": {"bot_id": bid}})
         uname = c.get("username") or bid
         status_icon = "🚫" if c.get("banned") else "✅"
-        rows.append([{"text": f"{status_icon} @{uname}", "callback_data": "noop"}])
-
-        ban_action = "unban" if c.get("banned") else "ban"
-        ban_label = ("✅ " + sc("unban")) if c.get("banned") else ("🚫 " + sc("ban"))
-        rows.append([
-            {"text": ban_label, "callback_data": f"cl:{ban_action}:{bid}:{page}"},
-            {"text": "🗑 " + sc("remove"), "callback_data": f"cl:rm:{bid}:{page}"},
-        ])
+        rows.append([{"text": f"{status_icon} @{uname}", "callback_data": f"cl:view:{bid}:{page}"}])
 
     total_pages = max(1, math.ceil(total / PAGE_SIZE))
     nav = []
@@ -179,7 +219,7 @@ def build_mybots_view(user_id):
         if not c.get("bot_id"):
             bots_col.update_one({"_id": c["_id"]}, {"$set": {"bot_id": bid}})
         rows.append(
-            [{"text": f"🗑 @{c.get('username') or bid}", "callback_data": f"mb:rm:{bid}"}]
+            [{"text": f"🤖 @{c.get('username') or bid}", "callback_data": f"mb:view:{bid}"}]
         )
     text = f"{sc('your clones')}\n\n{sc('total')}: {len(clones)}"
     return text, {"inline_keyboard": rows}
@@ -215,6 +255,13 @@ def handle_callback(token, bot_doc, callback):
             answer_callback(token, cb_id)
             return
 
+        if action == "back":
+            page = int(parts[2])
+            view_text, markup, _ = build_clones_keyboard(page)
+            edit_message(token, chat_id, message_id, view_text, markup)
+            answer_callback(token, cb_id)
+            return
+
         bot_id, page = parts[2], int(parts[3])
         clone = get_bot_by_id(bot_id)
         if not clone:
@@ -223,41 +270,60 @@ def handle_callback(token, bot_doc, callback):
             edit_message(token, chat_id, message_id, view_text, markup)
             return
 
+        def _clone_detail_kb(c):
+            ban_action = "unban" if c.get("banned") else "ban"
+            ban_label = ("✅ " + sc("unban")) if c.get("banned") else ("🚫 " + sc("ban"))
+            return {"inline_keyboard": [
+                [{"text": ban_label, "callback_data": f"cl:{ban_action}:{bot_id}:{page}"}],
+                [{"text": "🗑 " + sc("delete"), "callback_data": f"cl:rm:{bot_id}:{page}"}],
+                [{"text": "⬅️ " + sc("back"), "callback_data": f"cl:back:{page}"}],
+            ]}
+
+        if action == "view":
+            edit_message(token, chat_id, message_id, build_bot_detail_text(clone, bot_id), _clone_detail_kb(clone))
+            answer_callback(token, cb_id)
+            return
+
         if action == "ban":
             tg_call(clone["_id"], "deleteWebhook", {})
             bots_col.update_one({"_id": clone["_id"]}, {"$set": {"banned": True}})
             answer_callback(token, cb_id, sc("banned"))
+            clone["banned"] = True
+            edit_message(token, chat_id, message_id, build_bot_detail_text(clone, bot_id), _clone_detail_kb(clone))
+            return
 
-        elif action == "unban":
+        if action == "unban":
             tg_call(clone["_id"], "setWebhook", {"url": f"{BASE_URL}/webhook/{clone['_id']}"})
             bots_col.update_one({"_id": clone["_id"]}, {"$set": {"banned": False}})
             answer_callback(token, cb_id, sc("unbanned"))
+            clone["banned"] = False
+            edit_message(token, chat_id, message_id, build_bot_detail_text(clone, bot_id), _clone_detail_kb(clone))
+            return
 
-        elif action == "rm":
+        if action == "rm":
             uname = clone.get("username") or bot_id
             confirm_kb = {"inline_keyboard": [[
                 {"text": "✅ " + sc("confirm"), "callback_data": f"cl:rmyes:{bot_id}:{page}"},
-                {"text": "✖️ " + sc("cancel"), "callback_data": f"cl:page:{page}"},
+                {"text": "✖️ " + sc("cancel"), "callback_data": f"cl:view:{bot_id}:{page}"},
             ]]}
             edit_message(token, chat_id, message_id, f"{sc('remove')} @{uname}?", confirm_kb)
             answer_callback(token, cb_id)
             return
 
-        elif action == "rmyes":
+        if action == "rmyes":
             tg_call(clone["_id"], "deleteWebhook", {})
             bots_col.delete_one({"_id": clone["_id"]})
             answer_callback(token, cb_id, sc("removed"))
-
-        view_text, markup, _ = build_clones_keyboard(page)
-        edit_message(token, chat_id, message_id, view_text, markup)
-        return
+            view_text, markup, _ = build_clones_keyboard(page)
+            edit_message(token, chat_id, message_id, view_text, markup)
+            return
 
     # ── /mybots actions (any user, own clones only) ────────────────────────
     if data.startswith("mb:"):
         parts = data.split(":")
         action = parts[1]
 
-        if action == "cancel":
+        if action in ("cancel", "back"):
             view_text, markup = build_mybots_view(from_id)
             edit_message(token, chat_id, message_id, view_text, markup)
             answer_callback(token, cb_id)
@@ -269,17 +335,26 @@ def handle_callback(token, bot_doc, callback):
             answer_callback(token, cb_id, sc("not yours"), alert=True)
             return
 
+        if action == "view":
+            detail_kb = {"inline_keyboard": [
+                [{"text": "🗑 " + sc("delete"), "callback_data": f"mb:rm:{bot_id}"}],
+                [{"text": "⬅️ " + sc("back"), "callback_data": "mb:back"}],
+            ]}
+            edit_message(token, chat_id, message_id, build_bot_detail_text(clone, bot_id), detail_kb)
+            answer_callback(token, cb_id)
+            return
+
         if action == "rm":
             uname = clone.get("username") or bot_id
             confirm_kb = {"inline_keyboard": [[
                 {"text": "✅ " + sc("confirm"), "callback_data": f"mb:rmyes:{bot_id}"},
-                {"text": "✖️ " + sc("cancel"), "callback_data": "mb:cancel"},
+                {"text": "✖️ " + sc("cancel"), "callback_data": f"mb:view:{bot_id}"},
             ]]}
             edit_message(token, chat_id, message_id, f"{sc('remove your clone')} @{uname}?", confirm_kb)
             answer_callback(token, cb_id)
             return
 
-        elif action == "rmyes":
+        if action == "rmyes":
             tg_call(clone["_id"], "deleteWebhook", {})
             bots_col.delete_one({"_id": clone["_id"]})
             answer_callback(token, cb_id, sc("removed"))
@@ -323,7 +398,7 @@ def webhook(token):
     # "/clone" check just because it happens to start with the same letters.
     cmd = text.split(maxsplit=1)[0].split("@")[0] if text else ""
 
-    track_user(bot_id, from_id)
+    track_user(bot_id, from_id, message["from"].get("first_name"), message["from"].get("username"))
 
     is_owner = from_id == bot_doc.get("owner_id")
     is_main_owner = from_id == OWNER_ID
@@ -388,6 +463,7 @@ def webhook(token):
                 "parent_token": MAIN_BOT_TOKEN,
                 "bot_id": str(bot_result["id"]),
                 "username": bot_result.get("username"),
+                "name": bot_result.get("first_name"),
                 "banned": False,
             }},
             upsert=True,
