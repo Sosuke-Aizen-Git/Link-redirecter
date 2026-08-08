@@ -62,6 +62,7 @@ You should see `"ok": true`. That's it — the main bot is live.
 | Command | Who | Description |
 |---|---|---|
 | `/username <name>` | that clone's owner | Set this clone's own deep-link redirect target |
+| `/unclone` | that clone's owner (or main owner) | Removes this clone immediately — no need to go through `/mybots` on the main bot |
 | `/users` | that clone's owner (or main owner) | Total / active / blocked counts for **this clone's own** users |
 | `/refresh` | that clone's owner (or main owner) | Sweeps **this clone's own** users, removes anyone blocked/deactivated |
 
