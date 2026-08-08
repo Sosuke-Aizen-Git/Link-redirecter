@@ -139,15 +139,18 @@ def build_clones_keyboard(page=0):
 
     rows = []
     for c in page_items:
-        uname = c.get("username") or c.get("bot_id", "?")
+        bid = bot_id_of(c["_id"], c)
+        if not c.get("bot_id"):
+            bots_col.update_one({"_id": c["_id"]}, {"$set": {"bot_id": bid}})
+        uname = c.get("username") or bid
         status_icon = "🚫" if c.get("banned") else "✅"
         rows.append([{"text": f"{status_icon} @{uname}", "callback_data": "noop"}])
 
         ban_action = "unban" if c.get("banned") else "ban"
         ban_label = ("✅ " + sc("unban")) if c.get("banned") else ("🚫 " + sc("ban"))
         rows.append([
-            {"text": ban_label, "callback_data": f"cl:{ban_action}:{c['bot_id']}:{page}"},
-            {"text": "🗑 " + sc("remove"), "callback_data": f"cl:rm:{c['bot_id']}:{page}"},
+            {"text": ban_label, "callback_data": f"cl:{ban_action}:{bid}:{page}"},
+            {"text": "🗑 " + sc("remove"), "callback_data": f"cl:rm:{bid}:{page}"},
         ])
 
     total_pages = max(1, math.ceil(total / PAGE_SIZE))
@@ -170,10 +173,14 @@ def build_mybots_view(user_id):
     if not clones:
         return f"{sc('your clones')}\n\n{sc('you have none yet')}", None
 
-    rows = [
-        [{"text": f"🗑 @{c.get('username') or c.get('bot_id', '?')}", "callback_data": f"mb:rm:{c['bot_id']}"}]
-        for c in clones
-    ]
+    rows = []
+    for c in clones:
+        bid = bot_id_of(c["_id"], c)
+        if not c.get("bot_id"):
+            bots_col.update_one({"_id": c["_id"]}, {"$set": {"bot_id": bid}})
+        rows.append(
+            [{"text": f"🗑 @{c.get('username') or bid}", "callback_data": f"mb:rm:{bid}"}]
+        )
     text = f"{sc('your clones')}\n\n{sc('total')}: {len(clones)}"
     return text, {"inline_keyboard": rows}
 
