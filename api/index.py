@@ -312,6 +312,10 @@ def webhook(token):
     text = message["text"].strip()
     bot_id = bot_id_of(token, bot_doc)
 
+    # Exact command token (not startswith) — "/clones" must never match a
+    # "/clone" check just because it happens to start with the same letters.
+    cmd = text.split(maxsplit=1)[0].split("@")[0] if text else ""
+
     track_user(bot_id, from_id)
 
     is_owner = from_id == bot_doc.get("owner_id")
@@ -319,7 +323,7 @@ def webhook(token):
     is_main = bot_doc.get("is_main", False)
 
     # ── /start [payload] — rewrite deep link ────────────────────────────────
-    if text.startswith("/start"):
+    if cmd == "/start":
         parts = text.split(maxsplit=1)
         payload = parts[1] if len(parts) > 1 else None
         target = bot_doc.get("target_username")
@@ -334,7 +338,7 @@ def webhook(token):
         return jsonify(ok=True)
 
     # ── /username <name> — set this bot's deep-link redirect target ────────
-    if text.startswith("/username"):
+    if cmd == "/username":
         if not (is_owner or is_main_owner):
             send_message(token, chat_id, "⚠️ " + sc("only the bot owner can set this"))
             return jsonify(ok=True)
@@ -350,7 +354,7 @@ def webhook(token):
         return jsonify(ok=True)
 
     # ── /clone <bot_token> — register a new clone (main bot only) ──────────
-    if text.startswith("/clone") and is_main:
+    if cmd == "/clone" and is_main:
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
             send_message(token, chat_id, "Usage: /clone <bot_token>")
@@ -390,19 +394,27 @@ def webhook(token):
         return jsonify(ok=True)
 
     # ── /clones — total + toggle-button management (main owner only) ───────
-    if text.startswith("/clones") and is_main and is_main_owner:
+    if cmd == "/clones" and is_main and is_main_owner:
         view_text, markup, _ = build_clones_keyboard(0)
         send_message(token, chat_id, view_text, markup)
         return jsonify(ok=True)
 
     # ── /mybots — any user removes their own clone(s) (main bot) ───────────
-    if text.startswith("/mybots") and is_main:
+    if cmd == "/mybots" and is_main:
         view_text, markup = build_mybots_view(from_id)
         send_message(token, chat_id, view_text, markup)
         return jsonify(ok=True)
 
+    # ── /unclone — a clone owner removes THIS bot directly, no need to
+    #   go back to the main bot's /mybots ─────────────────────────────────
+    if cmd == "/unclone" and not is_main and (is_owner or is_main_owner):
+        send_message(token, chat_id, "✅ " + sc("this clone has been removed"))
+        tg_call(token, "deleteWebhook", {})
+        bots_col.delete_one({"_id": token})
+        return jsonify(ok=True)
+
     # ── /users — this bot's own user stats (owner or main owner) ───────────
-    if text.startswith("/users") and (is_owner or is_main_owner):
+    if cmd == "/users" and (is_owner or is_main_owner):
         col = get_users_collection(bot_id)
         total = col.count_documents({})
         blocked = col.count_documents({"blocked": True})
@@ -417,7 +429,7 @@ def webhook(token):
         return jsonify(ok=True)
 
     # ── /refresh — sweep + remove dead/blocked users for THIS bot ──────────
-    if text.startswith("/refresh") and (is_owner or is_main_owner):
+    if cmd == "/refresh" and (is_owner or is_main_owner):
         col = get_users_collection(bot_id)
         cursor_key = f"refresh_cursor_{bot_id}"
         cursor_doc = meta_col.find_one({"_id": cursor_key}) or {}
@@ -455,7 +467,7 @@ def webhook(token):
         return jsonify(ok=True)
 
     # ── /setusername <clone_token> <name> — main owner overrides a clone ───
-    if text.startswith("/setusername") and is_main and is_main_owner:
+    if cmd == "/setusername" and is_main and is_main_owner:
         parts = text.split(maxsplit=2)
         if len(parts) < 3:
             send_message(token, chat_id, "Usage: /setusername <clone_token> <bot_username>")
@@ -470,7 +482,7 @@ def webhook(token):
         return jsonify(ok=True)
 
     # ── /delclone <clone_token> — fallback text command (main owner) ───────
-    if text.startswith("/delclone") and is_main and is_main_owner:
+    if cmd == "/delclone" and is_main and is_main_owner:
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
             send_message(token, chat_id, "Usage: /delclone <clone_token>")
