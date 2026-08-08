@@ -16,6 +16,25 @@ BASE_URL = os.environ["BASE_URL"].rstrip("/")  # e.g. https://your-app.vercel.ap
 PAGE_SIZE = 5          # clones shown per page in /clones
 REFRESH_BATCH = 25     # users checked per /refresh call (stays well under Vercel's 10s cap)
 
+# ── Bot command menus (shown in Telegram's "/" menu) ────────────────────────
+MAIN_BOT_COMMANDS = [
+    {"command": "start", "description": "Get your redirect link"},
+    {"command": "username", "description": "Set this bot's redirect target"},
+    {"command": "clone", "description": "Register a new clone bot"},
+    {"command": "clones", "description": "Manage all clone bots"},
+    {"command": "mybots", "description": "Manage your own clone bots"},
+    {"command": "users", "description": "View this bot's user stats"},
+    {"command": "refresh", "description": "Sweep out dead or blocked users"},
+]
+
+CLONE_BOT_COMMANDS = [
+    {"command": "start", "description": "Get your redirect link"},
+    {"command": "username", "description": "Set this bot's redirect target"},
+    {"command": "users", "description": "View this bot's user stats"},
+    {"command": "refresh", "description": "Sweep out dead or blocked users"},
+    {"command": "unclone", "description": "Remove this bot"},
+]
+
 # ── DB (reused across warm invocations) ─────────────────────────────────────
 _client = MongoClient(MONGO_URL)
 db = _client["deeplink_bot"]
@@ -94,8 +113,13 @@ def bot_id_of(token, bot_doc):
     return (bot_doc or {}).get("bot_id") or token.split(":")[0]
 
 
+def set_bot_commands(token, commands):
+    tg_call(token, "setMyCommands", {"commands": commands})
+
+
 def ensure_main_bot():
-    if not get_bot_doc(MAIN_BOT_TOKEN):
+    doc = get_bot_doc(MAIN_BOT_TOKEN)
+    if not doc:
         me = tg_call(MAIN_BOT_TOKEN, "getMe", {})
         username = me.get("result", {}).get("username") if me.get("ok") else None
         bots_col.update_one(
@@ -109,9 +133,15 @@ def ensure_main_bot():
                 "username": username,
                 "name": me.get("result", {}).get("first_name") if me.get("ok") else None,
                 "banned": False,
+                "commands_set": True,
             }},
             upsert=True,
         )
+        set_bot_commands(MAIN_BOT_TOKEN, MAIN_BOT_COMMANDS)
+    elif not doc.get("commands_set"):
+        # Backfill for main bots registered before command menus existed.
+        set_bot_commands(MAIN_BOT_TOKEN, MAIN_BOT_COMMANDS)
+        bots_col.update_one({"_id": MAIN_BOT_TOKEN}, {"$set": {"commands_set": True}})
 
 
 def track_user(bot_id, user_id, first_name=None, username=None):
@@ -404,6 +434,11 @@ def webhook(token):
     is_main_owner = from_id == OWNER_ID
     is_main = bot_doc.get("is_main", False)
 
+    if not bot_doc.get("commands_set"):
+        # Backfill for bots registered before command menus existed.
+        set_bot_commands(token, MAIN_BOT_COMMANDS if is_main else CLONE_BOT_COMMANDS)
+        bots_col.update_one({"_id": token}, {"$set": {"commands_set": True}})
+
     # ── /start [payload] — rewrite deep link ────────────────────────────────
     if cmd == "/start":
         parts = text.split(maxsplit=1)
@@ -453,6 +488,8 @@ def webhook(token):
             send_message(token, chat_id, "❌ " + sc("could not set webhook") + f": {set_wh.get('description', '?')}")
             return jsonify(ok=True)
 
+        set_bot_commands(new_token, CLONE_BOT_COMMANDS)
+
         bot_result = me["result"]
         bots_col.update_one(
             {"_id": new_token},
@@ -465,6 +502,7 @@ def webhook(token):
                 "username": bot_result.get("username"),
                 "name": bot_result.get("first_name"),
                 "banned": False,
+                "commands_set": True,
             }},
             upsert=True,
         )
